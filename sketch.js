@@ -12,14 +12,17 @@ let currentImageIndex = 0;
 let lastSwitchTime = 0;
 const SWITCH_INTERVAL = 60000; // 30 seconds in milliseconds
 
-// Logic Maps
-let targetMap = [];
-let visitedMap = [];
+// Logic Maps (Pre-allocated for memory safety)
+let targetMap;
+let visitedMap;
 let crawlers = [];
+let spawnQueue; // Will now be a flat typed array, not an array of objects
+let spawnQueueLength = 0; 
 
 // Dimensions
 let imgWidth, imgHeight;
 let videoScale = 15; 
+let totalPixels; // Store the total pixel count
 
 // State
 let isProcessing = false;
@@ -28,9 +31,6 @@ let visitedPixelsCount = 0;
 
 // UI Controls
 let bgColorPicker;
-
-// Crawler Arrays
-let spawnQueue = [];        
 
 // --- CONFIGURATION ---
 const CRAWLER_COUNT = 60;   
@@ -41,7 +41,6 @@ const PILE_DENSITY = 9;
 // PRELOAD LOCAL IMAGES
 // =========================================================
 function preload() {
-  // Make sure these match the exact names in your resources folder
   img1 = loadImage('resources/LetteringFINAL1.png');
   img2 = loadImage('resources/LetteringFINAL2.png');
 }
@@ -53,6 +52,16 @@ function setup() {
   cnv = createCanvas(2160, 3840);
   pixelDensity(1);  
   
+  // OPTIMIZATION 1: Calculate global dimensions once
+  imgWidth = width;
+  imgHeight = height;
+  totalPixels = imgWidth * imgHeight;
+  
+  // OPTIMIZATION 2: Pre-allocate memory blocks ONCE. No more garbage collection crashes!
+  targetMap = new Uint8Array(totalPixels);
+  visitedMap = new Uint8Array(totalPixels);
+  spawnQueue = new Uint32Array(totalPixels); 
+  
   // 1. SETUP WEBCAM 
   video = createCapture(VIDEO, () => {
       console.log("Camera active");
@@ -60,13 +69,13 @@ function setup() {
   video.size(width / videoScale, height / videoScale);
   video.hide();
   
-  // 2. SETUP DRAWING LAYER (Matching canvas size)
-  sugarLayer = createGraphics(1080, 1920);
+  // 2. SETUP DRAWING LAYER (Created exactly ONCE)
+  sugarLayer = createGraphics(imgWidth, imgHeight);
   sugarLayer.noStroke();
   
-  // COLOR PICKER CONTROL (Fallback for background color)
+  // COLOR PICKER CONTROL
   bgColorPicker = createColorPicker('#141419'); 
-  bgColorPicker.hide(); // Hidden since we removed the HTML UI container
+  bgColorPicker.hide(); 
   
   // 3. INITIALIZE IMAGES
   images = [img1, img2];
@@ -77,7 +86,6 @@ function setup() {
 }
 
 function draw() {
-  // Use the color picker value or hardcode a color like background(20, 20, 25);
   background(bgColorPicker.color()); 
   
   // Draw the sugar layer
@@ -87,13 +95,8 @@ function draw() {
   // AUTO-SWITCH LOGIC
   // =========================================================
   if (millis() - lastSwitchTime > SWITCH_INTERVAL) {
-      // Move to the next image in the array
       currentImageIndex = (currentImageIndex + 1) % images.length;
-      
-      // Retrace the new image
       processImage(images[currentImageIndex]);
-      
-      // Reset the timer
       lastSwitchTime = millis();
   }
   
@@ -138,7 +141,6 @@ function processMotion() {
       let r2 = prevFramePixels[idx];
       
       if (Math.abs(r1 - r2) > MOTION_THRESHOLD) {
-          // Flip x-axis so interaction mirrors the user
           let screenX = map(w - x - 1, 0, w, 0, width);
           let screenY = map(y, 0, h, 0, height);
           
@@ -154,12 +156,10 @@ function processMotion() {
 
 function displaceSugar(x, y) {
     let radius = 50;        
-    let pushDist = 55;    
+    let pushDist = 55;   
 
-    // 1. Check the data map FIRST to see if we actually hit any sugar
     let sugarHitCount = updateMapLogic(x, y, radius);
     
-    // 2. If no sugar was hit in this area, STOP! Do not erase or draw new piles.
     if (sugarHitCount === 0) {
         return; 
     }
@@ -207,9 +207,9 @@ function updateMapLogic(x, y, radius) {
             let idx = cx + cy * imgWidth;
             if (targetMap[idx] && visitedMap[idx]) {
                 if (Math.abs(x - cx) + Math.abs(y - cy) < radius * 1.2) {
-                    visitedMap[idx] = false;
+                    visitedMap[idx] = 0; // Using 0 for Uint8Array
                     visitedPixelsCount--;
-                    removedPixels++; // We found and removed a sugar pixel
+                    removedPixels++; 
                 }
             }
         }
@@ -221,7 +221,6 @@ function updateMapLogic(x, y, radius) {
         }
     }
 
-    // Report back how much sugar was actually affected
     return removedPixels; 
 }
 
@@ -242,7 +241,7 @@ class Crawler {
     
     let idx = this.x + this.y * imgWidth;
     if (!visitedMap[idx]) { 
-        visitedMap[idx] = true; 
+        visitedMap[idx] = 1; // Using 1 for Uint8Array
         visitedPixelsCount++; 
     }
     
@@ -298,13 +297,16 @@ function maintainCrawlers() {
   let attempts = 0;
   while(crawlers.length < CRAWLER_COUNT && attempts < 20) {
       attempts++;
-      if (spawnQueue.length === 0) break;
-      let r = floor(random(spawnQueue.length));
-      let p = spawnQueue[r];
-      let idx = p.x + p.y * imgWidth;
+      if (spawnQueueLength === 0) break;
+      
+      // OPTIMIZATION 3: Decode flat array index back into X/Y coordinates
+      let r = floor(random(spawnQueueLength));
+      let idx = spawnQueue[r];
+      let px = idx % imgWidth;
+      let py = Math.floor(idx / imgWidth);
       
       if (!visitedMap[idx]) {
-          crawlers.push(new Crawler(p.x, p.y));
+          crawlers.push(new Crawler(px, py));
       }
   }
 }
@@ -322,22 +324,20 @@ function processImage(img) {
     cropX = 0; cropY = (img.height - cropH) / 2;
   }
   
-  // .get() returns a new p5.Image, protecting the original preload
   let croppedImg = img.get(cropX, cropY, cropW, cropH);
   croppedImg.resize(width, height);
   croppedImg.loadPixels();
   
-  imgWidth = croppedImg.width; 
-  imgHeight = croppedImg.height;
+  // CRITICAL FIX: Clear the existing canvas instead of creating a new one
+  sugarLayer.clear();
   
-  sugarLayer = createGraphics(imgWidth, imgHeight);
-  sugarLayer.noStroke();
+  // CRITICAL FIX: Overwrite the existing arrays instead of throwing them to the Garbage Collector
+  targetMap.fill(0);
+  visitedMap.fill(0);
   
-  targetMap = new Uint8Array(imgWidth * imgHeight); 
-  visitedMap = new Uint8Array(imgWidth * imgHeight);
-  
-  totalTargetPixels = 0; visitedPixelsCount = 0;
-  spawnQueue = [];
+  totalTargetPixels = 0; 
+  visitedPixelsCount = 0;
+  spawnQueueLength = 0;
   
   let totalBright = 0;
   for(let i=0; i<1000; i+=4) totalBright += croppedImg.pixels[i];
@@ -354,21 +354,25 @@ function processImage(img) {
     if (isTarget) { 
         targetMap[idx] = 1; 
         totalTargetPixels++; 
-        spawnQueue.push({x: idx % imgWidth, y: floor(idx / imgWidth)});
+        
+        // CRITICAL FIX: Push a flat number instead of a new {x, y} object
+        spawnQueue[spawnQueueLength] = idx;
+        spawnQueueLength++;
     }
   }
   
   crawlers = [];
   isProcessing = true;
+  
+  // Free image memory immediately
+  croppedImg = null;
 }
 
 // =========================================================
 // KEYBOARD CONTROLS
 // =========================================================
 function keyPressed() {
-  // Check if the pressed key is 'f' or 'F'
   if (key === 'f' || key === 'F') {
-    // Toggle fullscreen mode on and off
     let fs = fullscreen();
     fullscreen(!fs); 
   }
