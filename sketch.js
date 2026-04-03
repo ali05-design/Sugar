@@ -10,19 +10,19 @@ let img1, img2;
 let images = [];
 let currentImageIndex = 0;
 let lastSwitchTime = 0;
-const SWITCH_INTERVAL = 60000; // 30 seconds in milliseconds
+const SWITCH_INTERVAL = 60000; // 60 seconds in milliseconds
 
 // Logic Maps (Pre-allocated for memory safety)
 let targetMap;
 let visitedMap;
 let crawlers = [];
-let spawnQueue; // Will now be a flat typed array, not an array of objects
+let spawnQueue; // Flat typed array
 let spawnQueueLength = 0; 
 
 // Dimensions
 let imgWidth, imgHeight;
 let videoScale = 15; 
-let totalPixels; // Store the total pixel count
+let totalPixels; 
 
 // State
 let isProcessing = false;
@@ -52,12 +52,12 @@ function setup() {
   cnv = createCanvas(2160, 3840);
   pixelDensity(1);  
   
-  // OPTIMIZATION 1: Calculate global dimensions once
+  // Calculate global dimensions once
   imgWidth = width;
   imgHeight = height;
   totalPixels = imgWidth * imgHeight;
   
-  // OPTIMIZATION 2: Pre-allocate memory blocks ONCE. No more garbage collection crashes!
+  // Pre-allocate memory blocks ONCE
   targetMap = new Uint8Array(totalPixels);
   visitedMap = new Uint8Array(totalPixels);
   spawnQueue = new Uint32Array(totalPixels); 
@@ -77,10 +77,17 @@ function setup() {
   bgColorPicker = createColorPicker('#141419'); 
   bgColorPicker.hide(); 
   
-  // 3. INITIALIZE IMAGES
-  images = [img1, img2];
+  // 3. PRE-ALLOCATE CRAWLER POOL (Zero GC impact during runtime)
+  for(let i = 0; i < CRAWLER_COUNT; i++) {
+    let c = new Crawler(0, 0);
+    c.alive = false; // Start inactive
+    crawlers.push(c);
+  }
+
+  // 4. PRE-PROCESS IMAGES ONCE
+  images = [prepImage(img1), prepImage(img2)];
   
-  // Start processing the first image immediately
+  // Start processing the first image
   processImage(images[currentImageIndex]);
   lastSwitchTime = millis();
 }
@@ -116,6 +123,91 @@ function draw() {
        }
     }
   }
+}
+
+// =========================================================
+// MEMORY CLEANUP & SESSION MANAGEMENT
+// =========================================================
+
+// Completely sanitizes the heap and canvas between images
+function cleanupSession() {
+  isProcessing = false;
+
+  // 1. Clear the visual canvas layer completely
+  sugarLayer.clear();
+  
+  // 2. Zero-out all pre-allocated TypedArrays (No garbage collection triggered)
+  targetMap.fill(0);
+  visitedMap.fill(0);
+  spawnQueue.fill(0);
+  
+  // 3. Reset counting variables
+  totalTargetPixels = 0; 
+  visitedPixelsCount = 0;
+  spawnQueueLength = 0;
+
+  // 4. Scrub the crawler pool back to a dead state
+  for(let i = 0; i < crawlers.length; i++) {
+      crawlers[i].alive = false;
+      crawlers[i].life = 0;
+      crawlers[i].x = 0;
+      crawlers[i].y = 0;
+  }
+
+  console.log("Session memory wiped cleanly. Ready for next trace.");
+}
+
+// =========================================================
+// IMAGE PREPARATION & PROCESSING
+// =========================================================
+
+// Runs only in setup to avoid hidden canvas memory leaks
+function prepImage(img) {
+  let imgRatio = img.width / img.height;
+  let winRatio = width / height;
+  let cropW, cropH, cropX, cropY;
+  
+  if (imgRatio > winRatio) {
+    cropH = img.height; cropW = img.height * winRatio;
+    cropY = 0; cropX = (img.width - cropW) / 2;
+  } else {
+    cropW = img.width; cropH = img.width / winRatio;
+    cropX = 0; cropY = (img.height - cropH) / 2;
+  }
+  
+  let croppedImg = img.get(cropX, cropY, cropW, cropH);
+  croppedImg.resize(width, height);
+  croppedImg.loadPixels();
+  return croppedImg;
+}
+
+function processImage(img) {
+  // Wipe everything from the previous image safely
+  cleanupSession();
+  
+  let totalBright = 0;
+  for(let i = 0; i < 1000; i += 4) totalBright += img.pixels[i];
+  let isWhiteBg = (totalBright / 250) > 128;
+  
+  // Read the new image into our zeroed-out memory maps
+  for (let i = 0; i < img.pixels.length; i += 4) {
+    let b = (img.pixels[i] + img.pixels[i+1] + img.pixels[i+2]) / 3;
+    let idx = i / 4;
+    let isTarget = false;
+    
+    if (isWhiteBg) { if (b < 180) isTarget = true; } 
+    else { if (b > 80) isTarget = true; }
+    
+    if (isTarget) { 
+        targetMap[idx] = 1; 
+        totalTargetPixels++; 
+        
+        spawnQueue[spawnQueueLength] = idx;
+        spawnQueueLength++;
+    }
+  }
+  
+  isProcessing = true;
 }
 
 // =========================================================
@@ -216,7 +308,8 @@ function updateMapLogic(x, y, radius) {
     }
     
     for (let i = crawlers.length - 1; i >= 0; i--) {
-        if (dist(crawlers[i].x, crawlers[i].y, x, y) < radius + 20) {
+        // Only check alive crawlers
+        if (crawlers[i].alive && dist(crawlers[i].x, crawlers[i].y, x, y) < radius + 20) {
             crawlers[i].alive = false;
         }
     }
@@ -225,7 +318,7 @@ function updateMapLogic(x, y, radius) {
 }
 
 // =========================================================
-// CRAWLERS & IMAGE PROCESSING
+// CRAWLERS
 // =========================================================
 
 class Crawler {
@@ -290,82 +383,37 @@ function addSugarPile(x, y) {
 }
 
 function maintainCrawlers() {
-  for (let i = crawlers.length - 1; i >= 0; i--) {
-    if (!crawlers[i].alive) crawlers.splice(i, 1);
+  let attempts = 0;
+  
+  // Count how many are currently alive in the fixed pool
+  let activeCount = 0;
+  for (let i = 0; i < crawlers.length; i++) {
+      if (crawlers[i].alive) activeCount++;
   }
   
-  let attempts = 0;
-  while(crawlers.length < CRAWLER_COUNT && attempts < 20) {
+  while(activeCount < CRAWLER_COUNT && attempts < 20) {
       attempts++;
       if (spawnQueueLength === 0) break;
       
-      // OPTIMIZATION 3: Decode flat array index back into X/Y coordinates
       let r = floor(random(spawnQueueLength));
       let idx = spawnQueue[r];
       let px = idx % imgWidth;
       let py = Math.floor(idx / imgWidth);
       
       if (!visitedMap[idx]) {
-          crawlers.push(new Crawler(px, py));
+          // Revive the first dead crawler we find
+          for (let i = 0; i < crawlers.length; i++) {
+              if (!crawlers[i].alive) {
+                  crawlers[i].x = px;
+                  crawlers[i].y = py;
+                  crawlers[i].life = 0;
+                  crawlers[i].alive = true;
+                  activeCount++;
+                  break; 
+              }
+          }
       }
   }
-}
-
-function processImage(img) {
-  let imgRatio = img.width / img.height;
-  let winRatio = width / height;
-  let cropW, cropH, cropX, cropY;
-  
-  if (imgRatio > winRatio) {
-    cropH = img.height; cropW = img.height * winRatio;
-    cropY = 0; cropX = (img.width - cropW) / 2;
-  } else {
-    cropW = img.width; cropH = img.width / winRatio;
-    cropX = 0; cropY = (img.height - cropH) / 2;
-  }
-  
-  let croppedImg = img.get(cropX, cropY, cropW, cropH);
-  croppedImg.resize(width, height);
-  croppedImg.loadPixels();
-  
-  // CRITICAL FIX: Clear the existing canvas instead of creating a new one
-  sugarLayer.clear();
-  
-  // CRITICAL FIX: Overwrite the existing arrays instead of throwing them to the Garbage Collector
-  targetMap.fill(0);
-  visitedMap.fill(0);
-  
-  totalTargetPixels = 0; 
-  visitedPixelsCount = 0;
-  spawnQueueLength = 0;
-  
-  let totalBright = 0;
-  for(let i=0; i<1000; i+=4) totalBright += croppedImg.pixels[i];
-  let isWhiteBg = (totalBright / 250) > 128;
-  
-  for (let i = 0; i < croppedImg.pixels.length; i += 4) {
-    let b = (croppedImg.pixels[i] + croppedImg.pixels[i+1] + croppedImg.pixels[i+2]) / 3;
-    let idx = i / 4;
-    let isTarget = false;
-    
-    if (isWhiteBg) { if (b < 180) isTarget = true; } 
-    else { if (b > 80) isTarget = true; }
-    
-    if (isTarget) { 
-        targetMap[idx] = 1; 
-        totalTargetPixels++; 
-        
-        // CRITICAL FIX: Push a flat number instead of a new {x, y} object
-        spawnQueue[spawnQueueLength] = idx;
-        spawnQueueLength++;
-    }
-  }
-  
-  crawlers = [];
-  isProcessing = true;
-  
-  // Free image memory immediately
-  croppedImg = null;
 }
 
 // =========================================================
