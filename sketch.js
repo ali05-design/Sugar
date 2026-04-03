@@ -10,19 +10,24 @@ let img1, img2;
 let images = [];
 let currentImageIndex = 0;
 let lastSwitchTime = 0;
-const SWITCH_INTERVAL = 60000; // 60 seconds in milliseconds
+const SWITCH_INTERVAL = 60000; // 30 seconds in milliseconds
 
 // Logic Maps (Pre-allocated for memory safety)
 let targetMap;
 let visitedMap;
 let crawlers = [];
-let spawnQueue; // Flat typed array
+let spawnQueue; 
 let spawnQueueLength = 0; 
+
+// Memory-Safe Buffers & Caches
+let cropBuffer; 
+let cachedSugarColors = [];
+let cachedDisplaceColors = [];
 
 // Dimensions
 let imgWidth, imgHeight;
 let videoScale = 15; 
-let totalPixels; // Store the total pixel count
+let totalPixels; 
 
 // State
 let isProcessing = false;
@@ -52,15 +57,29 @@ function setup() {
   cnv = createCanvas(2160, 3840);
   pixelDensity(1);  
   
-  // Calculate global dimensions once
   imgWidth = width;
   imgHeight = height;
   totalPixels = imgWidth * imgHeight;
   
-  // Pre-allocate memory blocks ONCE
+  // OPTIMIZATION 1: Pre-allocate memory blocks
   targetMap = new Uint8Array(totalPixels);
   visitedMap = new Uint8Array(totalPixels);
   spawnQueue = new Uint32Array(totalPixels); 
+  
+  // OPTIMIZATION 2: Pre-allocate a single image buffer for resizing
+  // This prevents the p5.js "hidden canvas" memory leak during image switches
+  cropBuffer = createImage(imgWidth, imgHeight);
+  
+  // OPTIMIZATION 3: Pre-cache RGB strings to prevent GC thrashing in drawing loops
+  for (let i = 200; i <= 255; i++) {
+    cachedSugarColors[i] = `rgb(${i}, ${i}, 255)`;
+    cachedDisplaceColors[i] = `rgb(${i}, ${i}, ${i})`;
+  }
+
+  // OPTIMIZATION 4: Pre-allocate the crawler pool (No more 'new' or 'splice' in draw loop)
+  for (let i = 0; i < CRAWLER_COUNT; i++) {
+    crawlers.push(new Crawler());
+  }
   
   // 1. SETUP WEBCAM 
   video = createCapture(VIDEO, () => {
@@ -69,25 +88,16 @@ function setup() {
   video.size(width / videoScale, height / videoScale);
   video.hide();
   
-  // 2. SETUP DRAWING LAYER (Created exactly ONCE)
+  // 2. SETUP DRAWING LAYER 
   sugarLayer = createGraphics(imgWidth, imgHeight);
   sugarLayer.noStroke();
   
-  // COLOR PICKER CONTROL
   bgColorPicker = createColorPicker('#141419'); 
   bgColorPicker.hide(); 
   
-  // 3. PRE-ALLOCATE CRAWLER POOL (Zero GC impact during runtime)
-  for(let i = 0; i < CRAWLER_COUNT; i++) {
-    let c = new Crawler(0, 0);
-    c.alive = false; // Start inactive
-    crawlers.push(c);
-  }
-
-  // 4. PRE-PROCESS IMAGES ONCE
-  images = [prepImage(img1), prepImage(img2)];
+  // 3. INITIALIZE IMAGES
+  images = [img1, img2];
   
-  // Start processing the first image
   processImage(images[currentImageIndex]);
   lastSwitchTime = millis();
 }
@@ -95,7 +105,6 @@ function setup() {
 function draw() {
   background(bgColorPicker.color()); 
   
-  // Draw the sugar layer
   image(sugarLayer, 0, 0);
   
   // =========================================================
@@ -108,86 +117,21 @@ function draw() {
   }
   
   if (isProcessing) {
-    // 1. MOTION DETECTION
     processMotion();
     
-    // 2. HEALING LOGIC
     let deficit = totalTargetPixels - visitedPixelsCount;
     if (deficit > 0) {
        maintainCrawlers();
        let loops = deficit > 3000 ? 6 : 2; 
-       for (let i = 0; i < crawlers.length; i++) {
-         for (let n = 0; n < loops; n++) {
-            crawlers[i].step();
+       for (let i = 0; i < CRAWLER_COUNT; i++) {
+         if (crawlers[i].alive) {
+           for (let n = 0; n < loops; n++) {
+              crawlers[i].step();
+           }
          }
        }
     }
   }
-}
-
-// =========================================================
-// IMAGE PREPARATION & PROCESSING
-// =========================================================
-
-// Runs only in setup to avoid hidden canvas memory leaks
-function prepImage(img) {
-  let imgRatio = img.width / img.height;
-  let winRatio = width / height;
-  let cropW, cropH, cropX, cropY;
-  
-  if (imgRatio > winRatio) {
-    cropH = img.height; cropW = img.height * winRatio;
-    cropY = 0; cropX = (img.width - cropW) / 2;
-  } else {
-    cropW = img.width; cropH = img.width / winRatio;
-    cropX = 0; cropY = (img.height - cropH) / 2;
-  }
-  
-  let croppedImg = img.get(cropX, cropY, cropW, cropH);
-  croppedImg.resize(width, height);
-  croppedImg.loadPixels();
-  return croppedImg;
-}
-
-function processImage(img) {
-  // Clear the existing canvas instead of creating a new one
-  sugarLayer.clear();
-  
-  // Overwrite the existing arrays instead of throwing them to the Garbage Collector
-  targetMap.fill(0);
-  visitedMap.fill(0);
-  
-  totalTargetPixels = 0; 
-  visitedPixelsCount = 0;
-  spawnQueueLength = 0;
-  
-  let totalBright = 0;
-  for(let i = 0; i < 1000; i += 4) totalBright += img.pixels[i];
-  let isWhiteBg = (totalBright / 250) > 128;
-  
-  for (let i = 0; i < img.pixels.length; i += 4) {
-    let b = (img.pixels[i] + img.pixels[i+1] + img.pixels[i+2]) / 3;
-    let idx = i / 4;
-    let isTarget = false;
-    
-    if (isWhiteBg) { if (b < 180) isTarget = true; } 
-    else { if (b > 80) isTarget = true; }
-    
-    if (isTarget) { 
-        targetMap[idx] = 1; 
-        totalTargetPixels++; 
-        
-        spawnQueue[spawnQueueLength] = idx;
-        spawnQueueLength++;
-    }
-  }
-  
-  // Deactivate all crawlers for the new image (Recycling)
-  for(let i = 0; i < crawlers.length; i++) {
-      crawlers[i].alive = false;
-  }
-  
-  isProcessing = true;
 }
 
 // =========================================================
@@ -201,7 +145,7 @@ function processMotion() {
   let w = video.width;
   let h = video.height;
   
-  if (prevFramePixels.length === 0) {
+  if (prevFramePixels.length !== video.pixels.length) {
       prevFramePixels = new Uint8Array(video.pixels);
       return;
   }
@@ -260,8 +204,9 @@ function displaceSugar(x, y) {
         ctx.fillStyle = "rgba(0,0,0,0.15)";
         ctx.fillRect(sx + 1, sy + 1, size, size);
         
-        let br = random(200, 255);
-        ctx.fillStyle = `rgb(${br},${br},${br})`;
+        // Use cached color string to save memory
+        let br = Math.floor(random(200, 255));
+        ctx.fillStyle = cachedDisplaceColors[br];
         ctx.fillRect(sx, sy, size, size);
     }
 }
@@ -279,7 +224,7 @@ function updateMapLogic(x, y, radius) {
             let idx = cx + cy * imgWidth;
             if (targetMap[idx] && visitedMap[idx]) {
                 if (Math.abs(x - cx) + Math.abs(y - cy) < radius * 1.2) {
-                    visitedMap[idx] = 0; // Using 0 for Uint8Array
+                    visitedMap[idx] = 0; 
                     visitedPixelsCount--;
                     removedPixels++; 
                 }
@@ -287,8 +232,8 @@ function updateMapLogic(x, y, radius) {
         }
     }
     
-    for (let i = crawlers.length - 1; i >= 0; i--) {
-        // Only check alive crawlers
+    // Deactivate crawlers instead of destroying objects
+    for (let i = 0; i < CRAWLER_COUNT; i++) {
         if (crawlers[i].alive && dist(crawlers[i].x, crawlers[i].y, x, y) < radius + 20) {
             crawlers[i].alive = false;
         }
@@ -298,14 +243,25 @@ function updateMapLogic(x, y, radius) {
 }
 
 // =========================================================
-// CRAWLERS
+// CRAWLERS & IMAGE PROCESSING
 // =========================================================
 
 class Crawler {
-  constructor(x, y) {
-    this.x = x; this.y = y; this.alive = true;
+  constructor() {
+    this.x = 0; 
+    this.y = 0; 
+    this.alive = false;
     this.life = 0;
   }
+  
+  // New method: Re-initializes the existing object rather than creating a new one
+  spawn(x, y) {
+    this.x = x; 
+    this.y = y; 
+    this.alive = true;
+    this.life = 0;
+  }
+
   step() {
     if (!this.alive) return;
     this.life++;
@@ -314,7 +270,7 @@ class Crawler {
     
     let idx = this.x + this.y * imgWidth;
     if (!visitedMap[idx]) { 
-        visitedMap[idx] = 1; // Using 1 for Uint8Array
+        visitedMap[idx] = 1; 
         visitedPixelsCount++; 
     }
     
@@ -356,8 +312,9 @@ function addSugarPile(x, y) {
     ctx.fillStyle = "rgba(0,0,0,0.1)";
     ctx.fillRect(ox + 1, oy + 1, size, size);
     
-    let br = 220 + Math.random() * 35; 
-    ctx.fillStyle = `rgb(${br}, ${br}, 255)`;
+    // Use cached color string to save memory
+    let br = Math.floor(220 + Math.random() * 35); 
+    ctx.fillStyle = cachedSugarColors[br];
     ctx.fillRect(ox, oy, size, size);
   }
 }
@@ -365,15 +322,11 @@ function addSugarPile(x, y) {
 function maintainCrawlers() {
   let attempts = 0;
   
-  // Count how many are currently alive in the fixed pool
-  let activeCount = 0;
-  for (let i = 0; i < crawlers.length; i++) {
-      if (crawlers[i].alive) activeCount++;
-  }
-  
-  while(activeCount < CRAWLER_COUNT && attempts < 20) {
+  // Object Pooling: Search for inactive crawlers to revive
+  for (let i = 0; i < CRAWLER_COUNT; i++) {
+    if (!crawlers[i].alive) {
       attempts++;
-      if (spawnQueueLength === 0) break;
+      if (spawnQueueLength === 0 || attempts > 20) break;
       
       let r = floor(random(spawnQueueLength));
       let idx = spawnQueue[r];
@@ -381,19 +334,65 @@ function maintainCrawlers() {
       let py = Math.floor(idx / imgWidth);
       
       if (!visitedMap[idx]) {
-          // Revive the first dead crawler we find
-          for (let i = 0; i < crawlers.length; i++) {
-              if (!crawlers[i].alive) {
-                  crawlers[i].x = px;
-                  crawlers[i].y = py;
-                  crawlers[i].life = 0;
-                  crawlers[i].alive = true;
-                  activeCount++;
-                  break; 
-              }
-          }
+          crawlers[i].spawn(px, py); // Revive instead of 'new Crawler()'
       }
+    }
   }
+}
+
+function processImage(img) {
+  let imgRatio = img.width / img.height;
+  let winRatio = width / height;
+  let cropW, cropH, cropX, cropY;
+  
+  if (imgRatio > winRatio) {
+    cropH = img.height; cropW = img.height * winRatio;
+    cropY = 0; cropX = (img.width - cropW) / 2;
+  } else {
+    cropW = img.width; cropH = img.width / winRatio;
+    cropX = 0; cropY = (img.height - cropH) / 2;
+  }
+  
+  // CRITICAL FIX: Use the persistent buffer instead of img.get() and resize()
+  // This prevents the browser from generating thousands of orphaned canvas contexts over a weekend.
+  cropBuffer.copy(img, cropX, cropY, cropW, cropH, 0, 0, width, height);
+  cropBuffer.loadPixels();
+  
+  sugarLayer.clear();
+  
+  targetMap.fill(0);
+  visitedMap.fill(0);
+  
+  totalTargetPixels = 0; 
+  visitedPixelsCount = 0;
+  spawnQueueLength = 0;
+  
+  let totalBright = 0;
+  for(let i=0; i<1000; i+=4) totalBright += cropBuffer.pixels[i];
+  let isWhiteBg = (totalBright / 250) > 128;
+  
+  for (let i = 0; i < cropBuffer.pixels.length; i += 4) {
+    let b = (cropBuffer.pixels[i] + cropBuffer.pixels[i+1] + cropBuffer.pixels[i+2]) / 3;
+    let idx = i / 4;
+    let isTarget = false;
+    
+    if (isWhiteBg) { if (b < 180) isTarget = true; } 
+    else { if (b > 80) isTarget = true; }
+    
+    if (isTarget) { 
+        targetMap[idx] = 1; 
+        totalTargetPixels++; 
+        
+        spawnQueue[spawnQueueLength] = idx;
+        spawnQueueLength++;
+    }
+  }
+  
+  // Soft reset all crawlers in the pool
+  for(let i = 0; i < CRAWLER_COUNT; i++) {
+     crawlers[i].alive = false;
+  }
+  isProcessing = true;
 }
 
 // =========================================================
