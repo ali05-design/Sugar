@@ -22,7 +22,7 @@ let spawnQueueLength = 0;
 // Dimensions
 let imgWidth, imgHeight;
 let videoScale = 15; 
-let totalPixels; 
+let totalPixels; // Store the total pixel count
 
 // State
 let isProcessing = false;
@@ -126,38 +126,6 @@ function draw() {
 }
 
 // =========================================================
-// MEMORY CLEANUP & SESSION MANAGEMENT
-// =========================================================
-
-// Completely sanitizes the heap and canvas between images
-function cleanupSession() {
-  isProcessing = false;
-
-  // 1. Clear the visual canvas layer completely
-  sugarLayer.clear();
-  
-  // 2. Zero-out all pre-allocated TypedArrays (No garbage collection triggered)
-  targetMap.fill(0);
-  visitedMap.fill(0);
-  spawnQueue.fill(0);
-  
-  // 3. Reset counting variables
-  totalTargetPixels = 0; 
-  visitedPixelsCount = 0;
-  spawnQueueLength = 0;
-
-  // 4. Scrub the crawler pool back to a dead state
-  for(let i = 0; i < crawlers.length; i++) {
-      crawlers[i].alive = false;
-      crawlers[i].life = 0;
-      crawlers[i].x = 0;
-      crawlers[i].y = 0;
-  }
-
-  console.log("Session memory wiped cleanly. Ready for next trace.");
-}
-
-// =========================================================
 // IMAGE PREPARATION & PROCESSING
 // =========================================================
 
@@ -182,14 +150,21 @@ function prepImage(img) {
 }
 
 function processImage(img) {
-  // Wipe everything from the previous image safely
-  cleanupSession();
+  // Clear the existing canvas instead of creating a new one
+  sugarLayer.clear();
+  
+  // Overwrite the existing arrays instead of throwing them to the Garbage Collector
+  targetMap.fill(0);
+  visitedMap.fill(0);
+  
+  totalTargetPixels = 0; 
+  visitedPixelsCount = 0;
+  spawnQueueLength = 0;
   
   let totalBright = 0;
   for(let i = 0; i < 1000; i += 4) totalBright += img.pixels[i];
   let isWhiteBg = (totalBright / 250) > 128;
   
-  // Read the new image into our zeroed-out memory maps
   for (let i = 0; i < img.pixels.length; i += 4) {
     let b = (img.pixels[i] + img.pixels[i+1] + img.pixels[i+2]) / 3;
     let idx = i / 4;
@@ -205,6 +180,11 @@ function processImage(img) {
         spawnQueue[spawnQueueLength] = idx;
         spawnQueueLength++;
     }
+  }
+  
+  // Deactivate all crawlers for the new image (Recycling)
+  for(let i = 0; i < crawlers.length; i++) {
+      crawlers[i].alive = false;
   }
   
   isProcessing = true;
